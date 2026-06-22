@@ -1,0 +1,332 @@
+"""pages-mcp — host static sites/artifacts in-cluster, with an MCP upload tool.
+
+One FastMCP streamable-HTTP app on :8080, two planes dispatched by Host header:
+
+  * Control plane (bearer-gated):  https://pages-mcp.internal.white.fm/mcp
+      MCP tools: deploy_site, list_sites, get_site, delete_site.
+  * Serving plane (open on tailnet): https://pages.internal.white.fm/<site>/...
+      Static files from SITES_DIR/<site>/. A <base href="/<site>/"> is injected
+      into served HTML (when none is present) so relative-path multi-file sites
+      work under the path prefix, not just self-contained single files.
+
+Auth (Claude -> control plane): static bearer MCP_TOKEN. /healthz is open.
+Sites persist on a volume at SITES_DIR (default /data/sites).
+"""
+
+import base64
+import mimetypes
+import os
+import re
+import shutil
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+)
+from starlette.routing import Route
+
+MCP_TOKEN = os.environ.get("MCP_TOKEN", "")
+PORT = int(os.environ.get("PORT", "8080"))
+SITES_DIR = Path(os.environ.get("SITES_DIR", "/data/sites"))
+SERVE_HOST = os.environ.get("SERVE_HOST", "pages.internal.white.fm").lower()
+MCP_HOST = os.environ.get("MCP_HOST", "pages-mcp.internal.white.fm").lower()
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", f"https://{SERVE_HOST}").rstrip("/")
+# Per-site total upload cap (bytes); protects the backing volume.
+MAX_TOTAL_BYTES = int(os.environ.get("MAX_TOTAL_BYTES", str(64 * 1024 * 1024)))
+
+# DNS-label-ish: 1-63 chars, lowercase alnum + '-', not leading/trailing '-'.
+SITE_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+RESERVED_NAMES = {"mcp", "healthz", "favicon.ico", "robots.txt"}
+
+for _ext, _type in (
+    (".js", "text/javascript"),
+    (".mjs", "text/javascript"),
+    (".css", "text/css"),
+    (".svg", "image/svg+xml"),
+    (".json", "application/json"),
+    (".wasm", "application/wasm"),
+    (".woff2", "font/woff2"),
+    (".webmanifest", "application/manifest+json"),
+):
+    mimetypes.add_type(_type, _ext)
+
+mcp = FastMCP(
+    "pages",
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
+
+
+# --- helpers --------------------------------------------------------------
+
+def _site_dir(name: str) -> Path:
+    if not isinstance(name, str) or not SITE_NAME_RE.match(name) or name in RESERVED_NAMES:
+        raise ValueError(
+            f"invalid site name {name!r}: use 1-63 lowercase letters/digits/'-' "
+            "(not starting or ending with '-'), and not a reserved name"
+        )
+    return SITES_DIR / name
+
+
+def _safe_member(root: Path, rel: str) -> Path:
+    """Resolve rel within root, rejecting traversal/absolute/empty paths."""
+    if not isinstance(rel, str) or not rel.strip("/") or "\x00" in rel:
+        raise ValueError(f"invalid file path {rel!r}")
+    rel = rel.lstrip("/")
+    if rel.endswith("/"):
+        raise ValueError(f"invalid file path {rel!r}")
+    root_r = root.resolve()
+    target = (root / rel).resolve()
+    if target != root_r and root_r not in target.parents:
+        raise ValueError(f"path escapes site root: {rel!r}")
+    return target
+
+
+def _site_stats(name: str) -> dict:
+    d = _site_dir(name)
+    files = total = 0
+    latest = 0.0
+    for p in d.rglob("*"):
+        if p.is_file():
+            st = p.stat()
+            files += 1
+            total += st.st_size
+            latest = max(latest, st.st_mtime)
+    return {
+        "name": name,
+        "url": f"{PUBLIC_BASE_URL}/{name}/",
+        "files": files,
+        "bytes": total,
+        "modified": datetime.fromtimestamp(latest, tz=timezone.utc).isoformat() if latest else None,
+    }
+
+
+# --- MCP tools ------------------------------------------------------------
+
+@mcp.tool()
+def deploy_site(name: str, files: list[dict], replace: bool = True) -> dict:
+    """Deploy a static site/artifact, served at https://pages.internal.white.fm/<name>/.
+
+    name: lowercase DNS-label slug (a-z, 0-9, '-'), 1-63 chars. The site's URL.
+    files: list of {"path": "index.html", "content": "<...>", "encoding": "text"}.
+        - path: relative path within the site (e.g. "index.html", "assets/app.js").
+          Subdirectories are created automatically; "../" and absolute paths are rejected.
+        - content: the file body.
+        - encoding: "text" (default, utf-8) or "base64" for binary assets (images, fonts).
+    replace: True (default) replaces the site with exactly these files; False merges
+        the given files into an existing site (leaving other files in place).
+
+    Put an index.html at the site root or the URL will 404. Returns {url, files, bytes}.
+    """
+    d = _site_dir(name)
+    if not isinstance(files, list) or not files:
+        raise ValueError("files must be a non-empty list of {path, content[, encoding]}")
+
+    # Validate + decode everything before touching disk.
+    staged: list[tuple[str, bytes]] = []
+    total = 0
+    for i, f in enumerate(files):
+        if not isinstance(f, dict) or "path" not in f or "content" not in f:
+            raise ValueError(f"files[{i}] must be an object with 'path' and 'content'")
+        rel = f["path"]
+        enc = (f.get("encoding") or "text").lower()
+        if enc == "base64":
+            try:
+                data = base64.b64decode(f["content"], validate=True)
+            except Exception as exc:
+                raise ValueError(f"files[{i}] ({rel!r}): invalid base64: {exc}")
+        elif enc == "text":
+            if not isinstance(f["content"], str):
+                raise ValueError(f"files[{i}] ({rel!r}): text content must be a string")
+            data = f["content"].encode("utf-8")
+        else:
+            raise ValueError(f"files[{i}] ({rel!r}): encoding must be 'text' or 'base64'")
+        _safe_member(SITES_DIR / name, rel)  # path-safety check (rejects traversal)
+        total += len(data)
+        staged.append((rel, data))
+
+    if total > MAX_TOTAL_BYTES:
+        raise ValueError(f"site too large: {total} bytes exceeds limit of {MAX_TOTAL_BYTES}")
+
+    SITES_DIR.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(dir=SITES_DIR, prefix=f".{name}.tmp."))
+    try:
+        for rel, data in staged:
+            target = _safe_member(staging, rel)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        if replace:
+            if d.exists():
+                shutil.rmtree(d)
+            staging.replace(d)
+            staging = None  # consumed
+        else:
+            d.mkdir(parents=True, exist_ok=True)
+            for rel, _ in staged:
+                src = _safe_member(staging, rel)
+                dst = _safe_member(d, rel)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(dst))
+    finally:
+        if staging is not None and staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+
+    stats = _site_stats(name)
+    if not (d / "index.html").is_file():
+        stats["warning"] = "no index.html at the site root; the base URL will 404 until one exists"
+    return stats
+
+
+@mcp.tool()
+def list_sites() -> list[dict]:
+    """List all hosted sites with their URL, file count, total size, and last-modified time."""
+    if not SITES_DIR.exists():
+        return []
+    return [
+        _site_stats(c.name)
+        for c in sorted(SITES_DIR.iterdir())
+        if c.is_dir() and SITE_NAME_RE.match(c.name)
+    ]
+
+
+@mcp.tool()
+def get_site(name: str) -> dict:
+    """Get a site's URL, stats, and the list of file paths it contains."""
+    d = _site_dir(name)
+    if not d.is_dir():
+        raise ValueError(f"site {name!r} does not exist")
+    stats = _site_stats(name)
+    stats["paths"] = sorted(str(p.relative_to(d)) for p in d.rglob("*") if p.is_file())
+    return stats
+
+
+@mcp.tool()
+def delete_site(name: str) -> dict:
+    """Delete a hosted site and all of its files. Returns {name, deleted}."""
+    d = _site_dir(name)
+    existed = d.is_dir()
+    if existed:
+        shutil.rmtree(d)
+    return {"name": name, "deleted": existed}
+
+
+# --- static serving plane -------------------------------------------------
+
+_BASE_HEAD_RE = re.compile(rb"<head[^>]*>", re.IGNORECASE)
+_BASE_HTML_RE = re.compile(rb"<html[^>]*>", re.IGNORECASE)
+
+
+def _inject_base(html: bytes, prefix: str) -> bytes:
+    """Inject <base href="prefix"> so relative asset paths resolve under the site path."""
+    if b"<base" in html[:4096].lower():
+        return html
+    tag = f'<base href="{prefix}">'.encode("utf-8")
+    for pat in (_BASE_HEAD_RE, _BASE_HTML_RE):
+        m = pat.search(html)
+        if m:
+            return html[: m.end()] + tag + html[m.end():]
+    return tag + html
+
+
+def _listing() -> HTMLResponse:
+    items = []
+    if SITES_DIR.exists():
+        for c in sorted(SITES_DIR.iterdir()):
+            if c.is_dir() and SITE_NAME_RE.match(c.name):
+                items.append(f'<li><a href="/{c.name}/">{c.name}</a></li>')
+    body = (
+        "<!doctype html><html><head><meta charset=utf-8><title>pages</title>"
+        "<style>body{font:16px/1.5 system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem}"
+        "h1{font-size:1.25rem}</style></head><body><h1>hosted sites</h1><ul>"
+        + ("".join(items) or "<li><em>none yet</em></li>")
+        + "</ul></body></html>"
+    )
+    return HTMLResponse(body)
+
+
+async def _serve(request: Request) -> Response:
+    raw = request.url.path
+    parts = [p for p in raw.split("/") if p]
+    if not parts:
+        return _listing()
+    site = parts[0]
+    try:
+        site_root = _site_dir(site)
+    except ValueError:
+        return PlainTextResponse("not found", status_code=404)
+    if not site_root.is_dir():
+        return PlainTextResponse("not found", status_code=404)
+
+    if len(parts) == 1:
+        if not raw.endswith("/"):
+            return RedirectResponse(raw + "/", status_code=308)
+        target = site_root / "index.html"
+    else:
+        try:
+            target = _safe_member(site_root, "/".join(parts[1:]))
+        except ValueError:
+            return PlainTextResponse("bad request", status_code=400)
+        if target.is_dir():
+            if not raw.endswith("/"):
+                return RedirectResponse(raw + "/", status_code=308)
+            target = target / "index.html"
+
+    if not target.is_file():
+        return PlainTextResponse("not found", status_code=404)
+
+    data = target.read_bytes()
+    ctype, _ = mimetypes.guess_type(target.name)
+    if target.suffix.lower() in (".html", ".htm"):
+        data = _inject_base(data, f"/{site}/")
+        ctype = "text/html; charset=utf-8"
+    return Response(
+        content=data,
+        media_type=ctype or "application/octet-stream",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+async def _healthz(_request: Request) -> PlainTextResponse:
+    return PlainTextResponse("ok")
+
+
+class Gate(BaseHTTPMiddleware):
+    """Host-based plane split + bearer auth for the control plane."""
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if path == "/healthz":
+            return await call_next(request)
+        host = (request.headers.get("host") or "").split(":")[0].lower()
+        is_mcp = path == "/mcp" or path.startswith("/mcp/")
+        if is_mcp:
+            if host == SERVE_HOST:  # never expose the control plane on the content host
+                return PlainTextResponse("not found", status_code=404)
+            if MCP_TOKEN and request.headers.get("authorization", "") != f"Bearer {MCP_TOKEN}":
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
+            return await call_next(request)
+        if host == MCP_HOST:  # keep the control-plane host free of served content
+            return PlainTextResponse("not found", status_code=404)
+        return await call_next(request)
+
+
+app = mcp.streamable_http_app()
+app.add_middleware(Gate)
+app.router.routes.append(Route("/healthz", _healthz, methods=["GET"]))
+app.router.routes.append(Route("/{path:path}", _serve, methods=["GET", "HEAD"]))
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    SITES_DIR.mkdir(parents=True, exist_ok=True)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
