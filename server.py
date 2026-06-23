@@ -15,11 +15,14 @@ Sites persist on a volume at SITES_DIR (default /data/sites).
 """
 
 import base64
+import logging
 import mimetypes
 import os
 import re
 import shutil
+import subprocess
 import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -46,6 +49,10 @@ MCP_HOST = os.environ.get("MCP_HOST", "pages-mcp.internal.white.fm").lower()
 PUBLIC_SCHEME = os.environ.get("PUBLIC_SCHEME", "https")
 # Per-site total upload cap (bytes); protects the backing volume.
 MAX_TOTAL_BYTES = int(os.environ.get("MAX_TOTAL_BYTES", str(64 * 1024 * 1024)))
+GIT_REMOTE = os.environ.get("GIT_REMOTE", "").strip()
+GIT_SSH_KEY = os.environ.get("GIT_SSH_KEY", "").strip()
+GIT_AUTHOR_NAME = os.environ.get("GIT_AUTHOR_NAME", "pages-mcp")
+GIT_AUTHOR_EMAIL = os.environ.get("GIT_AUTHOR_EMAIL", "pages-mcp@white.fm")
 
 # DNS-label-ish: 1-63 chars, lowercase alnum + '-', not leading/trailing '-'.
 SITE_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -141,6 +148,88 @@ def _site_stats(name: str) -> dict:
     }
 
 
+# --- git mirror (best-effort backup to GIT_REMOTE; never breaks the tools) ---
+
+log = logging.getLogger("pages.git")
+_git_lock = threading.Lock()
+_git_ready = False
+_git_ssh_command: "str | None" = None
+
+
+def _git(*args, check=True):
+    env = dict(os.environ)
+    env["HOME"] = "/tmp"
+    if _git_ssh_command:
+        env["GIT_SSH_COMMAND"] = _git_ssh_command
+    cmd = ["git", "-C", str(SITES_DIR), "-c", "safe.directory=*", *args]
+    return subprocess.run(cmd, env=env, check=check, capture_output=True, text=True, timeout=120)
+
+
+def _has_origin_main() -> bool:
+    return _git("rev-parse", "--verify", "--quiet", "origin/main", check=False).returncode == 0
+
+
+def _count_sites() -> int:
+    if not SITES_DIR.exists():
+        return 0
+    return sum(1 for c in SITES_DIR.iterdir() if c.is_dir() and SITE_NAME_RE.match(c.name))
+
+
+def _git_sync(message: str) -> None:
+    """Commit the current SITES_DIR state and push to GIT_REMOTE. Never raises."""
+    if not _git_ready:
+        return
+    with _git_lock:
+        try:
+            _git("add", "-A")
+            if not _git("status", "--porcelain").stdout.strip():
+                return
+            _git("commit", "-q", "-m", message)
+            _git("push", "-q", "origin", "HEAD:main")
+            log.info("git: %s", message)
+        except Exception as exc:
+            log.warning("git sync failed (%s): %s", message, exc)
+
+
+def git_setup() -> None:
+    """Bind SITES_DIR to GIT_REMOTE: restore from git if the volume is empty,
+    else adopt history (volume is authoritative). Best-effort; never raises."""
+    global _git_ready, _git_ssh_command
+    if not GIT_REMOTE:
+        log.info("GIT_REMOTE unset; git mirror disabled")
+        return
+    try:
+        SITES_DIR.mkdir(parents=True, exist_ok=True)
+        if GIT_SSH_KEY and Path(GIT_SSH_KEY).is_file():
+            keydst = "/tmp/pages_git_key"
+            shutil.copyfile(GIT_SSH_KEY, keydst)
+            os.chmod(keydst, 0o600)
+            _git_ssh_command = (
+                f"ssh -i {keydst} -o IdentitiesOnly=yes "
+                "-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/known_hosts"
+            )
+        if not (SITES_DIR / ".git").is_dir():
+            _git("init", "-q")
+            _git("remote", "add", "origin", GIT_REMOTE, check=False)
+        _git("remote", "set-url", "origin", GIT_REMOTE, check=False)
+        _git("config", "user.name", GIT_AUTHOR_NAME)
+        _git("config", "user.email", GIT_AUTHOR_EMAIL)
+        _git("fetch", "--quiet", "origin", "main", check=False)
+        if _has_origin_main():
+            if _count_sites() == 0:
+                _git("reset", "--hard", "origin/main")   # restore: empty volume
+                log.info("restored sites from %s", GIT_REMOTE)
+            else:
+                _git("reset", "--mixed", "origin/main")   # adopt; volume authoritative
+            _git("checkout", "--", "README.md", check=False)  # keep repo docs in tree
+        _git_ready = True
+        log.info("git mirror ready (%s)", GIT_REMOTE)
+        _git_sync("sync on startup")
+    except Exception as exc:
+        _git_ready = False
+        log.warning("git setup failed; mirror disabled this run: %s", exc)
+
+
 # --- MCP tools ------------------------------------------------------------
 
 @mcp.tool()
@@ -215,6 +304,7 @@ def deploy_site(name: str, files: list[dict], replace: bool = True) -> dict:
     stats = _site_stats(name)
     if not (d / "index.html").is_file():
         stats["warning"] = "no index.html at the site root; the base URL will 404 until one exists"
+    _git_sync(f"deploy {name}")
     return stats
 
 
@@ -248,6 +338,7 @@ def delete_site(name: str) -> dict:
     existed = d.is_dir()
     if existed:
         shutil.rmtree(d)
+        _git_sync(f"delete {name}")
     return {"name": name, "deleted": existed}
 
 
@@ -362,4 +453,6 @@ if __name__ == "__main__":
     import uvicorn
 
     SITES_DIR.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(level=logging.INFO)
+    git_setup()
     uvicorn.run(app, host="0.0.0.0", port=PORT)
