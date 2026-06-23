@@ -4,10 +4,11 @@ One FastMCP streamable-HTTP app on :8080, two planes dispatched by Host header:
 
   * Control plane (bearer-gated):  https://pages-mcp.internal.white.fm/mcp
       MCP tools: deploy_site, list_sites, get_site, delete_site.
-  * Serving plane (open on tailnet): https://pages.internal.white.fm/<site>/...
-      Static files from SITES_DIR/<site>/. A <base href="/<site>/"> is injected
-      into served HTML (when none is present) so relative-path multi-file sites
-      work under the path prefix, not just self-contained single files.
+  * Serving plane (open on tailnet): https://<site>.pages.internal.white.fm/...
+      Each site gets its own subdomain under the SERVE_HOST zone; files come from
+      SITES_DIR/<site>/. A <base href="/"> is injected into served HTML (when none
+      is present) so relative-path multi-file sites resolve from the site root.
+      The apex (https://pages.internal.white.fm/) serves a directory index.
 
 Auth (Claude -> control plane): static bearer MCP_TOKEN. /healthz is open.
 Sites persist on a volume at SITES_DIR (default /data/sites).
@@ -38,9 +39,11 @@ from starlette.routing import Route
 MCP_TOKEN = os.environ.get("MCP_TOKEN", "")
 PORT = int(os.environ.get("PORT", "8080"))
 SITES_DIR = Path(os.environ.get("SITES_DIR", "/data/sites"))
+# Serve zone: each site is hosted at https://<name>.<SERVE_HOST>/. The apex
+# (Host == SERVE_HOST) serves the directory index.
 SERVE_HOST = os.environ.get("SERVE_HOST", "pages.internal.white.fm").lower()
 MCP_HOST = os.environ.get("MCP_HOST", "pages-mcp.internal.white.fm").lower()
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", f"https://{SERVE_HOST}").rstrip("/")
+PUBLIC_SCHEME = os.environ.get("PUBLIC_SCHEME", "https")
 # Per-site total upload cap (bytes); protects the backing volume.
 MAX_TOTAL_BYTES = int(os.environ.get("MAX_TOTAL_BYTES", str(64 * 1024 * 1024)))
 
@@ -67,6 +70,34 @@ mcp = FastMCP(
 
 
 # --- helpers --------------------------------------------------------------
+
+def _site_url(name: str) -> str:
+    return f"{PUBLIC_SCHEME}://{name}.{SERVE_HOST}/"
+
+
+def _req_host(request: Request) -> str:
+    return (request.headers.get("host") or "").split(":")[0].lower()
+
+
+def _is_serve_host(host: str) -> bool:
+    """True for the content plane: the apex zone or any <label>.<SERVE_HOST>."""
+    return host == SERVE_HOST or host.endswith("." + SERVE_HOST)
+
+
+def _site_from_host(host: str) -> str | None:
+    """Site name from a serve Host, or None for the apex / non-content hosts.
+
+    <name>.<SERVE_HOST> -> "<name>" (single label, must pass SITE_NAME_RE and not
+    be reserved). The apex (Host == SERVE_HOST) and anything else -> None.
+    """
+    suffix = "." + SERVE_HOST
+    if not host.endswith(suffix):
+        return None
+    label = host[: -len(suffix)]
+    if "." in label or not SITE_NAME_RE.match(label) or label in RESERVED_NAMES:
+        return None
+    return label
+
 
 def _site_dir(name: str) -> Path:
     if not isinstance(name, str) or not SITE_NAME_RE.match(name) or name in RESERVED_NAMES:
@@ -103,7 +134,7 @@ def _site_stats(name: str) -> dict:
             latest = max(latest, st.st_mtime)
     return {
         "name": name,
-        "url": f"{PUBLIC_BASE_URL}/{name}/",
+        "url": _site_url(name),
         "files": files,
         "bytes": total,
         "modified": datetime.fromtimestamp(latest, tz=timezone.utc).isoformat() if latest else None,
@@ -114,9 +145,10 @@ def _site_stats(name: str) -> dict:
 
 @mcp.tool()
 def deploy_site(name: str, files: list[dict], replace: bool = True) -> dict:
-    """Deploy a static site/artifact, served at https://pages.internal.white.fm/<name>/.
+    """Deploy a static site/artifact, served at https://<name>.pages.internal.white.fm/.
 
-    name: lowercase DNS-label slug (a-z, 0-9, '-'), 1-63 chars. The site's URL.
+    name: lowercase DNS-label slug (a-z, 0-9, '-'), 1-63 chars. Becomes the site's
+        subdomain, so it must also be a valid DNS label.
     files: list of {"path": "index.html", "content": "<...>", "encoding": "text"}.
         - path: relative path within the site (e.g. "index.html", "assets/app.js").
           Subdirectories are created automatically; "../" and absolute paths are rejected.
@@ -242,7 +274,7 @@ def _listing() -> HTMLResponse:
     if SITES_DIR.exists():
         for c in sorted(SITES_DIR.iterdir()):
             if c.is_dir() and SITE_NAME_RE.match(c.name):
-                items.append(f'<li><a href="/{c.name}/">{c.name}</a></li>')
+                items.append(f'<li><a href="{_site_url(c.name)}">{c.name}</a></li>')
     body = (
         "<!doctype html><html><head><meta charset=utf-8><title>pages</title>"
         "<style>body{font:16px/1.5 system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem}"
@@ -254,25 +286,26 @@ def _listing() -> HTMLResponse:
 
 
 async def _serve(request: Request) -> Response:
+    host = _req_host(request)
     raw = request.url.path
-    parts = [p for p in raw.split("/") if p]
-    if not parts:
-        return _listing()
-    site = parts[0]
-    try:
-        site_root = _site_dir(site)
-    except ValueError:
+    site = _site_from_host(host)
+    if site is None:
+        # Apex zone root -> directory index. Anything else (other hosts, or a path
+        # on the apex) is 404: sites live on subdomains, not under a path prefix.
+        if host == SERVE_HOST and not raw.strip("/"):
+            return _listing()
         return PlainTextResponse("not found", status_code=404)
+
+    site_root = SITES_DIR / site
     if not site_root.is_dir():
         return PlainTextResponse("not found", status_code=404)
 
-    if len(parts) == 1:
-        if not raw.endswith("/"):
-            return RedirectResponse(raw + "/", status_code=308)
+    rel = raw.strip("/")
+    if not rel:
         target = site_root / "index.html"
     else:
         try:
-            target = _safe_member(site_root, "/".join(parts[1:]))
+            target = _safe_member(site_root, rel)
         except ValueError:
             return PlainTextResponse("bad request", status_code=400)
         if target.is_dir():
@@ -286,7 +319,7 @@ async def _serve(request: Request) -> Response:
     data = target.read_bytes()
     ctype, _ = mimetypes.guess_type(target.name)
     if target.suffix.lower() in (".html", ".htm"):
-        data = _inject_base(data, f"/{site}/")
+        data = _inject_base(data, "/")
         ctype = "text/html; charset=utf-8"
     return Response(
         content=data,
@@ -306,10 +339,10 @@ class Gate(BaseHTTPMiddleware):
         path = request.url.path
         if path == "/healthz":
             return await call_next(request)
-        host = (request.headers.get("host") or "").split(":")[0].lower()
+        host = _req_host(request)
         is_mcp = path == "/mcp" or path.startswith("/mcp/")
         if is_mcp:
-            if host == SERVE_HOST:  # never expose the control plane on the content host
+            if _is_serve_host(host):  # never expose the control plane on a content host
                 return PlainTextResponse("not found", status_code=404)
             if MCP_TOKEN and request.headers.get("authorization", "") != f"Bearer {MCP_TOKEN}":
                 return JSONResponse({"error": "unauthorized"}, status_code=401)
