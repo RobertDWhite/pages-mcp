@@ -360,19 +360,78 @@ def _inject_base(html: bytes, prefix: str) -> bytes:
     return tag + html
 
 
+_INDEX_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pages</title>
+<style>
+  :root{
+    --bg:#0a0c10; --panel:#141821; --panel2:#1a1f2b;
+    --text:#e8edf4; --muted:#8b95a7; --ring:#283142;
+    --accent:#6ea8fe; --accent2:#a78bfa; --ok:#3ddc84;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{
+    min-height:100vh; color:var(--text);
+    background:
+      radial-gradient(1100px 520px at 50% -8%, #1b2438 0%, rgba(27,36,56,0) 60%),
+      var(--bg);
+    font:16px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:62rem; margin:0 auto; padding:5.5rem 1.25rem 4rem}
+  .brand{display:flex; align-items:center; gap:.7rem; font-size:1.7rem; font-weight:750; letter-spacing:-.03em}
+  .glyph{width:1.5rem; height:1.5rem; border-radius:.45rem;
+    background:linear-gradient(135deg,var(--accent),var(--accent2)); box-shadow:0 6px 18px rgba(110,168,254,.35)}
+  .sub{color:var(--muted); margin-top:.5rem; font-size:.95rem}
+  .count{color:var(--text); font-weight:600}
+  .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(15.5rem,1fr)); gap:1rem; margin-top:2.4rem}
+  .card{display:flex; flex-direction:column; gap:.45rem; padding:1.15rem 1.25rem;
+    background:linear-gradient(180deg,var(--panel2),var(--panel));
+    border:1px solid var(--ring); border-radius:1rem; text-decoration:none; color:inherit;
+    transition:transform .16s ease, border-color .16s ease, box-shadow .16s ease}
+  .card:hover{transform:translateY(-3px); border-color:var(--accent); box-shadow:0 12px 34px rgba(0,0,0,.4)}
+  .name{display:flex; align-items:center; gap:.55rem; font-weight:650; font-size:1.06rem; letter-spacing:-.01em}
+  .dot{width:.5rem; height:.5rem; border-radius:50%; background:var(--ok); box-shadow:0 0 0 4px rgba(61,220,132,.16)}
+  .host{color:var(--muted); font:12.5px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; word-break:break-all}
+  .empty{color:var(--muted); padding:2.5rem; border:1px dashed var(--ring); border-radius:1rem; text-align:center}
+  code{background:var(--panel2); border:1px solid var(--ring); border-radius:.4rem; padding:.1rem .35rem; font-size:.85em}
+  footer{margin-top:3.5rem; padding-top:1.25rem; border-top:1px solid var(--ring); color:var(--muted); font-size:.82rem;
+    display:flex; justify-content:space-between; flex-wrap:wrap; gap:.6rem}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="brand"><span class="glyph"></span>pages</div>
+      <div class="sub">self-hosted static sites &middot; <span class="count">__COUNT__</span> live</div>
+    </header>
+    <main class="grid">__GRID__</main>
+    <footer><span>pages.internal.white.fm</span><span>white.fm</span></footer>
+  </div>
+</body>
+</html>"""
+
+
 def _listing() -> HTMLResponse:
-    items = []
+    cards = []
     if SITES_DIR.exists():
         for c in sorted(SITES_DIR.iterdir()):
             if c.is_dir() and SITE_NAME_RE.match(c.name):
-                items.append(f'<li><a href="{_site_url(c.name)}">{c.name}</a></li>')
-    body = (
-        "<!doctype html><html><head><meta charset=utf-8><title>pages</title>"
-        "<style>body{font:16px/1.5 system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem}"
-        "h1{font-size:1.25rem}</style></head><body><h1>hosted sites</h1><ul>"
-        + ("".join(items) or "<li><em>none yet</em></li>")
-        + "</ul></body></html>"
+                url = _site_url(c.name)
+                host = url.split("://", 1)[-1].rstrip("/")
+                cards.append(
+                    '<a class="card" href="' + url + '">'
+                    '<span class="name"><span class="dot"></span>' + c.name + "</span>"
+                    '<span class="host">' + host + "</span></a>"
+                )
+    grid = "".join(cards) or (
+        '<p class="empty">No sites yet — deploy one with the <code>pages</code> MCP tool.</p>'
     )
+    body = _INDEX_HTML.replace("__GRID__", grid).replace("__COUNT__", str(len(cards)))
     return HTMLResponse(body)
 
 
