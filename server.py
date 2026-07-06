@@ -42,9 +42,16 @@ from starlette.routing import Route
 MCP_TOKEN = os.environ.get("MCP_TOKEN", "")
 PORT = int(os.environ.get("PORT", "8080"))
 SITES_DIR = Path(os.environ.get("SITES_DIR", "/data/sites"))
-# Serve zone: each site is hosted at https://<name>.<SERVE_HOST>/. The apex
-# (Host == SERVE_HOST) serves the directory index.
-SERVE_HOST = os.environ.get("SERVE_HOST", "pages.internal.white.fm").lower()
+# Serve zone(s): each site is hosted at https://<name>.<serve-host>/. SERVE_HOST
+# may be a comma-separated list (e.g. an internal host plus a public,
+# Authentik-gated host that proxies straight to this service); a site is served
+# for any of them. The first is canonical for display URLs and the apex index.
+SERVE_HOSTS = [
+    h.strip().lower()
+    for h in os.environ.get("SERVE_HOST", "pages.internal.white.fm").split(",")
+    if h.strip()
+]
+SERVE_HOST = SERVE_HOSTS[0]
 MCP_HOST = os.environ.get("MCP_HOST", "pages-mcp.internal.white.fm").lower()
 PUBLIC_SCHEME = os.environ.get("PUBLIC_SCHEME", "https")
 # Per-site total upload cap (bytes); protects the backing volume.
@@ -87,23 +94,25 @@ def _req_host(request: Request) -> str:
 
 
 def _is_serve_host(host: str) -> bool:
-    """True for the content plane: the apex zone or any <label>.<SERVE_HOST>."""
-    return host == SERVE_HOST or host.endswith("." + SERVE_HOST)
+    """True for the content plane: any serve-host apex or <label>.<serve-host>."""
+    return any(host == h or host.endswith("." + h) for h in SERVE_HOSTS)
 
 
 def _site_from_host(host: str) -> str | None:
-    """Site name from a serve Host, or None for the apex / non-content hosts.
+    """Site name from a serve Host, or None for an apex / non-content host.
 
-    <name>.<SERVE_HOST> -> "<name>" (single label, must pass SITE_NAME_RE and not
-    be reserved). The apex (Host == SERVE_HOST) and anything else -> None.
+    <name>.<serve-host> -> "<name>" (single label, must pass SITE_NAME_RE and not
+    be reserved). Any serve-host apex and anything else -> None.
     """
-    suffix = "." + SERVE_HOST
-    if not host.endswith(suffix):
-        return None
-    label = host[: -len(suffix)]
-    if "." in label or not SITE_NAME_RE.match(label) or label in RESERVED_NAMES:
-        return None
-    return label
+    for serve_host in SERVE_HOSTS:
+        suffix = "." + serve_host
+        if not host.endswith(suffix):
+            continue
+        label = host[: -len(suffix)]
+        if "." in label or not SITE_NAME_RE.match(label) or label in RESERVED_NAMES:
+            return None
+        return label
+    return None
 
 
 def _site_dir(name: str) -> Path:
@@ -442,7 +451,7 @@ async def _serve(request: Request) -> Response:
     if site is None:
         # Apex zone root -> directory index. Anything else (other hosts, or a path
         # on the apex) is 404: sites live on subdomains, not under a path prefix.
-        if host == SERVE_HOST and not raw.strip("/"):
+        if host in SERVE_HOSTS and not raw.strip("/"):
             return _listing()
         return PlainTextResponse("not found", status_code=404)
 
