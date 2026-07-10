@@ -501,7 +501,10 @@ class Gate(BaseHTTPMiddleware):
         host = _req_host(request)
         is_mcp = path == "/mcp" or path.startswith("/mcp/")
         if is_mcp:
-            if _is_serve_host(host):  # never expose the control plane on a content host
+            # Never expose the control plane on a content host — but the MCP host
+            # itself can match a serve-host suffix (e.g. pages-mcp.internal.white.fm
+            # ends with .white.fm when white.fm is in SERVE_HOST), so exempt it.
+            if host != MCP_HOST and _is_serve_host(host):
                 return PlainTextResponse("not found", status_code=404)
             if MCP_TOKEN and request.headers.get("authorization", "") != f"Bearer {MCP_TOKEN}":
                 return JSONResponse({"error": "unauthorized"}, status_code=401)
