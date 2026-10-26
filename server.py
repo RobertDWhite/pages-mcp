@@ -20,6 +20,7 @@ import mimetypes
 import os
 import re
 import shutil
+import shlex
 import subprocess
 import tempfile
 import threading
@@ -58,6 +59,7 @@ PUBLIC_SCHEME = os.environ.get("PUBLIC_SCHEME", "https")
 MAX_TOTAL_BYTES = int(os.environ.get("MAX_TOTAL_BYTES", str(64 * 1024 * 1024)))
 GIT_REMOTE = os.environ.get("GIT_REMOTE", "").strip()
 GIT_SSH_KEY = os.environ.get("GIT_SSH_KEY", "").strip()
+GIT_KNOWN_HOSTS = os.environ.get("GIT_KNOWN_HOSTS", "").strip()
 GIT_AUTHOR_NAME = os.environ.get("GIT_AUTHOR_NAME", "pages-mcp")
 GIT_AUTHOR_EMAIL = os.environ.get("GIT_AUTHOR_EMAIL", "pages-mcp@white.fm")
 
@@ -213,10 +215,16 @@ def git_setup() -> None:
             keydst = "/tmp/pages_git_key"
             shutil.copyfile(GIT_SSH_KEY, keydst)
             os.chmod(keydst, 0o600)
-            _git_ssh_command = (
-                f"ssh -i {keydst} -o IdentitiesOnly=yes "
-                "-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/known_hosts"
-            )
+            host_options = "-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/known_hosts"
+            if GIT_KNOWN_HOSTS:
+                known_hosts = Path(GIT_KNOWN_HOSTS).resolve(strict=True)
+                if not known_hosts.is_file():
+                    raise ValueError("GIT_KNOWN_HOSTS must be a readable known_hosts file")
+                host_options = (
+                    "-o StrictHostKeyChecking=yes "
+                    f"-o UserKnownHostsFile={shlex.quote(str(known_hosts))}"
+                )
+            _git_ssh_command = f"ssh -i {shlex.quote(keydst)} -o IdentitiesOnly=yes {host_options}"
         if not (SITES_DIR / ".git").is_dir():
             _git("init", "-q")
             _git("remote", "add", "origin", GIT_REMOTE, check=False)
