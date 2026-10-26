@@ -9,12 +9,19 @@ One FastMCP streamable-HTTP app on :8080, two planes dispatched by Host header:
       SITES_DIR/<site>/. A <base href="/"> is injected into served HTML (when none
       is present) so relative-path multi-file sites resolve from the site root.
       The apex (https://pages.internal.white.fm/) serves a directory index.
+  * Writable data files (opt-in per site): a site may list JSON files in
+      pages-writable.json that browsers can PUT back, e.g. a page that saves
+      user-curated state. Only on WRITE_HOSTS, only listed paths, JSON only,
+      size-capped, If-Match for lost-update protection; each write is committed
+      to the git mirror and survives redeploys of the site.
 
 Auth (Claude -> control plane): static bearer MCP_TOKEN. /healthz is open.
 Sites persist on a volume at SITES_DIR (default /data/sites).
 """
 
 import base64
+import hashlib
+import json
 import logging
 import mimetypes
 import os
@@ -38,6 +45,7 @@ from starlette.responses import (
     RedirectResponse,
     Response,
 )
+from starlette.background import BackgroundTask
 from starlette.routing import Route
 
 MCP_TOKEN = os.environ.get("MCP_TOKEN", "")
@@ -57,6 +65,16 @@ MCP_HOST = os.environ.get("MCP_HOST", "pages-mcp.internal.white.fm").lower()
 PUBLIC_SCHEME = os.environ.get("PUBLIC_SCHEME", "https")
 # Per-site total upload cap (bytes); protects the backing volume.
 MAX_TOTAL_BYTES = int(os.environ.get("MAX_TOTAL_BYTES", str(64 * 1024 * 1024)))
+# Writable data files: browsers may PUT a site's opted-in JSON files, but only via
+# these serve zones. Defaults to the canonical (internal) zone so that a site also
+# published on a public zone stays read-only there.
+WRITE_HOSTS = [
+    h.strip().lower()
+    for h in os.environ.get("WRITE_HOSTS", SERVE_HOST).split(",")
+    if h.strip()
+]
+WRITABLE_CONFIG = "pages-writable.json"
+MAX_WRITABLE_BYTES = int(os.environ.get("MAX_WRITABLE_BYTES", str(1024 * 1024)))
 GIT_REMOTE = os.environ.get("GIT_REMOTE", "").strip()
 GIT_SSH_KEY = os.environ.get("GIT_SSH_KEY", "").strip()
 GIT_KNOWN_HOSTS = os.environ.get("GIT_KNOWN_HOSTS", "").strip()
@@ -157,6 +175,40 @@ def _site_stats(name: str) -> dict:
         "bytes": total,
         "modified": datetime.fromtimestamp(latest, tz=timezone.utc).isoformat() if latest else None,
     }
+
+
+def _writable(site_root: Path) -> dict[str, int]:
+    """A site's writable files, {relpath: max_bytes}, from its pages-writable.json.
+
+    {"files": {"collages/saved.json": {"max_bytes": 262144}}}
+    Only .json paths inside the site qualify, never the config itself; a missing
+    or malformed config means nothing is writable.
+    """
+    try:
+        cfg = json.loads((site_root / WRITABLE_CONFIG).read_text("utf-8"))
+        files = cfg.get("files") if isinstance(cfg, dict) else None
+    except (OSError, ValueError):
+        return {}
+    out: dict[str, int] = {}
+    if not isinstance(files, dict):
+        return out
+    for rel, opts in files.items():
+        if not isinstance(rel, str):
+            continue
+        rel = rel.strip("/")
+        if not rel.endswith(".json") or rel == WRITABLE_CONFIG:
+            continue
+        try:
+            _safe_member(site_root, rel)
+        except ValueError:
+            continue
+        cap = opts.get("max_bytes") if isinstance(opts, dict) else None
+        out[rel] = min(cap, MAX_WRITABLE_BYTES) if isinstance(cap, int) and cap > 0 else MAX_WRITABLE_BYTES
+    return out
+
+
+def _etag(data: bytes) -> str:
+    return '"' + hashlib.sha256(data).hexdigest()[:32] + '"'
 
 
 # --- git mirror (best-effort backup to GIT_REMOTE; never breaks the tools) ---
@@ -295,6 +347,18 @@ def deploy_site(name: str, files: list[dict], replace: bool = True) -> dict:
     if total > MAX_TOTAL_BYTES:
         raise ValueError(f"site too large: {total} bytes exceeds limit of {MAX_TOTAL_BYTES}")
 
+    # Writable files hold data saved from the browser, so the live copy outlives
+    # any redeploy: a deploy can seed one but never overwrite or remove it.
+    live: dict[str, bytes] = {}
+    if d.is_dir():
+        for rel in _writable(d):
+            p = _safe_member(d, rel)
+            if p.is_file():
+                live[rel] = p.read_bytes()
+    staged = [(rel, data) for rel, data in staged if rel.strip("/") not in live]
+    if replace:
+        staged += list(live.items())
+
     SITES_DIR.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(dir=SITES_DIR, prefix=f".{name}.tmp."))
     try:
@@ -319,6 +383,8 @@ def deploy_site(name: str, files: list[dict], replace: bool = True) -> dict:
             shutil.rmtree(staging, ignore_errors=True)
 
     stats = _site_stats(name)
+    if live:
+        stats["preserved"] = sorted(live)
     if not (d / "index.html").is_file():
         stats["warning"] = "no index.html at the site root; the base URL will 404 until one exists"
     _git_sync(f"deploy {name}")
@@ -485,13 +551,75 @@ async def _serve(request: Request) -> Response:
 
     data = target.read_bytes()
     ctype, _ = mimetypes.guess_type(target.name)
+    headers = {"Cache-Control": "no-cache"}
     if target.suffix.lower() in (".html", ".htm"):
         data = _inject_base(data, "/")
         ctype = "text/html; charset=utf-8"
+    elif target.suffix.lower() == ".json" and rel in _writable(site_root):
+        headers["ETag"] = _etag(data)
     return Response(
         content=data,
         media_type=ctype or "application/octet-stream",
-        headers={"Cache-Control": "no-cache"},
+        headers=headers,
+    )
+
+
+_write_lock = threading.Lock()
+
+
+async def _write(request: Request) -> Response:
+    """PUT a site's opted-in writable JSON file (see _writable)."""
+    host = _req_host(request)
+    site = _site_from_host(host)
+    if site is None or not any(host.endswith("." + h) for h in WRITE_HOSTS):
+        return PlainTextResponse("writes are not enabled on this host", status_code=403)
+    site_root = SITES_DIR / site
+    if not site_root.is_dir():
+        return PlainTextResponse("not found", status_code=404)
+    rel = request.url.path.strip("/")
+    cap = _writable(site_root).get(rel)
+    if cap is None:
+        return PlainTextResponse("not a writable file", status_code=403)
+    # Same-origin only: a page on another site must not write this one.
+    origin = request.headers.get("origin")
+    if origin and origin.split("://", 1)[-1].split(":")[0].lower() != host:
+        return PlainTextResponse("cross-origin write refused", status_code=403)
+    if not (request.headers.get("content-type") or "").lower().startswith("application/json"):
+        return PlainTextResponse("expected application/json", status_code=415)
+    try:
+        if int(request.headers.get("content-length") or 0) > cap:
+            return PlainTextResponse(f"body exceeds {cap} bytes", status_code=413)
+    except ValueError:
+        return PlainTextResponse("bad content-length", status_code=400)
+    body = await request.body()
+    if len(body) > cap:
+        return PlainTextResponse(f"body exceeds {cap} bytes", status_code=413)
+    try:
+        json.loads(body)
+    except ValueError:
+        return PlainTextResponse("body is not valid JSON", status_code=400)
+
+    target = _safe_member(site_root, rel)
+    with _write_lock:
+        current = target.read_bytes() if target.is_file() else None
+        if_match = request.headers.get("if-match")
+        if if_match and if_match.strip() != "*":
+            if current is None or if_match.strip() != _etag(current):
+                headers = {"ETag": _etag(current)} if current is not None else {}
+                return PlainTextResponse("file changed since it was read", status_code=412, headers=headers)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
+        with os.fdopen(fd, "wb") as f:
+            f.write(body)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, target)
+    etag = _etag(body)
+    log.info("write %s/%s (%d bytes)", site, rel, len(body))
+    # commit after responding: a git push can take seconds
+    return JSONResponse(
+        {"ok": True, "path": rel, "bytes": len(body)},
+        headers={"ETag": etag},
+        background=BackgroundTask(_git_sync, f"update {site}/{rel}"),
     )
 
 
@@ -526,6 +654,7 @@ app = mcp.streamable_http_app()
 app.add_middleware(Gate)
 app.router.routes.append(Route("/healthz", _healthz, methods=["GET"]))
 app.router.routes.append(Route("/{path:path}", _serve, methods=["GET", "HEAD"]))
+app.router.routes.append(Route("/{path:path}", _write, methods=["PUT"]))
 
 
 if __name__ == "__main__":

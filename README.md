@@ -19,6 +19,29 @@ multi-file sites work under the path prefix, not just self-contained single file
 | `get_site(name)` | One site's stats + the list of file paths. |
 | `delete_site(name)` | Remove a site and all its files. |
 
+## Writable data files
+
+A site can let its own pages save JSON back to the server, e.g. a gallery that
+keeps user-curated items. Opt in by deploying a `pages-writable.json` at the site
+root:
+
+```json
+{"files": {"collages/saved.json": {"max_bytes": 262144}}}
+```
+
+Then the page can `PUT` that path with `Content-Type: application/json`:
+
+- Only on `WRITE_HOSTS` (default: the canonical `SERVE_HOST`, i.e. the internal
+  zone), so a site also exposed on a public zone stays read-only there.
+- Only listed `.json` paths; the body must parse as JSON and fit `max_bytes`
+  (capped by `MAX_WRITABLE_BYTES`). Cross-origin `Origin` headers are refused.
+- `GET` returns an `ETag`; send it back as `If-Match` and a write that raced
+  another one gets `412` with the current `ETag`, so the page can re-read, merge
+  and retry instead of silently dropping the other write.
+- Each write is committed to the git mirror (`update <site>/<path>`).
+- The live file outlives redeploys: `deploy_site` seeds a writable file the first
+  time but never overwrites or deletes it afterwards (returned as `preserved`).
+
 `/healthz` is open (used by k8s probes). Site names are lowercase DNS labels
 (`a-z`, `0-9`, `-`), 1–63 chars.
 
@@ -33,6 +56,8 @@ multi-file sites work under the path prefix, not just self-contained single file
 | `MCP_HOST` | `pages-mcp.internal.white.fm` | Control host (Host header → `/mcp`). |
 | `PUBLIC_BASE_URL` | `https://$SERVE_HOST` | Base used in returned URLs. |
 | `MAX_TOTAL_BYTES` | `67108864` (64 MiB) | Per-site upload cap. |
+| `WRITE_HOSTS` | first `SERVE_HOST` | Serve zones that accept writable-file `PUT`s (comma-separated). |
+| `MAX_WRITABLE_BYTES` | `1048576` (1 MiB) | Upper bound for any writable file. |
 
 ## Build
 
