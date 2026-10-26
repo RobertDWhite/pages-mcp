@@ -27,7 +27,9 @@ COPY --from=ssh-builder /build/openssh-10.6p1/LICENCE /usr/local/share/openssh/L
 RUN ssh -V 2>&1 | grep "OpenSSH_10.6p1"
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && pip check
+RUN pip install --no-cache-dir -r requirements.txt && pip check \
+    && python -m pip uninstall --yes pip \
+    && rm -rf /usr/local/lib/python3.14/ensurepip
 
 COPY server.py .
 
