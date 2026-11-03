@@ -14,6 +14,9 @@ One FastMCP streamable-HTTP app on :8080, two planes dispatched by Host header:
       user-curated state. Only on WRITE_HOSTS, only listed paths, JSON only,
       size-capped, If-Match for lost-update protection; each write is committed
       to the git mirror and survives redeploys of the site.
+  * Git mirror (optional, GIT_REMOTE): every change is committed and pushed, and
+      an empty volume is restored from it. Image files are never committed, so
+      they are not restored either -- redeploy them from their source.
 
 Auth (Claude -> control plane): static bearer MCP_TOKEN. /healthz is open.
 Sites persist on a volume at SITES_DIR (default /data/sites).
@@ -80,6 +83,12 @@ GIT_SSH_KEY = os.environ.get("GIT_SSH_KEY", "").strip()
 GIT_KNOWN_HOSTS = os.environ.get("GIT_KNOWN_HOSTS", "").strip()
 GIT_AUTHOR_NAME = os.environ.get("GIT_AUTHOR_NAME", "pages-mcp")
 GIT_AUTHOR_EMAIL = os.environ.get("GIT_AUTHOR_EMAIL", "pages-mcp@white.fm")
+# Images are never committed to the git mirror: they are served from the volume
+# and kept at their source (e.g. Synology), not in git history.
+GIT_EXCLUDE_EXTS = (
+    "jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "avif",
+    "bmp", "tif", "tiff", "svg", "ico",
+)
 
 # DNS-label-ish: 1-63 chars, lowercase alnum + '-', not leading/trailing '-'.
 SITE_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -254,6 +263,15 @@ def _git_sync(message: str) -> None:
             log.warning("git sync failed (%s): %s", message, exc)
 
 
+def _git_exclude_images() -> None:
+    """Keep image files out of the mirror via the repo-local exclude file, which
+    applies even if a site ships its own .gitignore."""
+    info = SITES_DIR / ".git" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    rules = "".join(f"*.{e}\n*.{e.upper()}\n" for e in GIT_EXCLUDE_EXTS)
+    (info / "exclude").write_text("# managed by pages-mcp: no images in git\n" + rules)
+
+
 def git_setup() -> None:
     """Bind SITES_DIR to GIT_REMOTE: restore from git if the volume is empty,
     else adopt history (volume is authoritative). Best-effort; never raises."""
@@ -283,6 +301,7 @@ def git_setup() -> None:
         _git("remote", "set-url", "origin", GIT_REMOTE, check=False)
         _git("config", "user.name", GIT_AUTHOR_NAME)
         _git("config", "user.email", GIT_AUTHOR_EMAIL)
+        _git_exclude_images()
         _git("fetch", "--quiet", "origin", "main", check=False)
         if _has_origin_main():
             if _count_sites() == 0:
@@ -291,6 +310,9 @@ def git_setup() -> None:
             else:
                 _git("reset", "--mixed", "origin/main")   # adopt; volume authoritative
             _git("checkout", "--", "README.md", check=False)  # keep repo docs in tree
+        # Stop tracking any image an older version committed (files stay on disk).
+        _git("rm", "-r", "-q", "--cached", "--ignore-unmatch", "--",
+             *(f":(glob,icase)**/*.{e}" for e in GIT_EXCLUDE_EXTS), check=False)
         _git_ready = True
         log.info("git mirror ready (%s)", GIT_REMOTE)
         _git_sync("sync on startup")

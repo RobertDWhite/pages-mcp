@@ -42,6 +42,16 @@ Then the page can `PUT` that path with `Content-Type: application/json`:
 - The live file outlives redeploys: `deploy_site` seeds a writable file the first
   time but never overwrites or deletes it afterwards (returned as `preserved`).
 
+## Git mirror
+
+With `GIT_REMOTE` set, every deploy, delete and writable-file save is committed
+and pushed there, and an empty volume is restored from it on startup.
+**Image files are never committed** (`jpg jpeg png gif webp heic heif avif bmp tif
+tiff svg ico`, any case): they are excluded through the repo-local
+`.git/info/exclude`, and any image an older version committed is untracked on
+startup. Images live on the volume and at their source; after a restore,
+redeploy the site from its source to bring them back.
+
 `/healthz` is open (used by k8s probes). Site names are lowercase DNS labels
 (`a-z`, `0-9`, `-`), 1–63 chars.
 
